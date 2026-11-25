@@ -1,0 +1,200 @@
+using System;
+using System.IO;
+using UnityEngine;
+
+public sealed class MetricsLogger : MonoBehaviour
+{
+    [Header("File")]
+    [SerializeField] private string _filePrefix = "Metrics";
+
+
+    private string _filePath;
+    private bool _isFinalized;
+    private bool _isLogging;
+
+
+    public string FilePath => _filePath;
+    public bool IsFinalized => _isFinalized;
+    public bool IsLogging => _isLogging;
+
+
+    private void Awake()
+    {
+        if (!ParticipantSession.HasParticipantId)
+        {
+            return;
+        }
+
+        _isLogging = true;
+
+        CreateLogFile();
+    }
+
+
+    public void LogInteraction(InteractionResult result)
+    {
+        if (!_isLogging)
+        {
+            return;
+        }
+
+        string actualTime = result.ActualTime.HasValue
+            ? result.ActualTime.Value.ToString("F4")
+            : "N/A";
+
+        string timingOffset = result.TimingOffset.HasValue
+            ? result.TimingOffset.Value.ToString("F4")
+            : "N/A";
+
+        string timingError = result.TimingError.HasValue
+            ? result.TimingError.Value.ToString("F4")
+            : "N/A";
+
+        string reactionTime = result.ReactionTime.HasValue
+            ? result.ReactionTime.Value.ToString("F4")
+            : "N/A";
+
+        string spatialAccuracy = result.SpatialAccuracy.HasValue
+            ? result.SpatialAccuracy.Value.ToString("F4")
+            : "N/A";
+
+        string directionAccuracy = result.DirectionAccuracy.HasValue
+            ? result.DirectionAccuracy.Value.ToString("F4")
+            : "N/A";
+
+        string correctHand = result.UsedCorrectHand.HasValue
+            ? result.UsedCorrectHand.Value.ToString()
+            : "N/A";
+
+        string line =
+            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | " +
+            $"Minigame: {result.MinigameId} | " +
+            $"Type: {result.InteractionType} | " +
+            $"Outcome: {result.Outcome} | " +
+            $"Difficulty: {result.Difficulty} | " +
+            $"ExpectedTime: {result.ExpectedTime:F4} | " +
+            $"ActualTime: {actualTime} | " +
+            $"TimingOffset: {timingOffset} | " +
+            $"TimingError: {timingError} | " +
+            $"ReactionTime: {reactionTime} | " +
+            $"SpatialAccuracy: {spatialAccuracy} | " +
+            $"DirectionAccuracy: {directionAccuracy} | " +
+            $"CorrectHand: {correctHand}";
+
+        File.AppendAllText(_filePath, line + Environment.NewLine);
+    }
+
+    public void LogPlayerState(PlayerState state)
+    {
+        if (!_isLogging)
+        {
+            return;
+        }
+        
+        string line =
+            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | " +
+            $"PlayerState: {state}";
+
+        File.AppendAllText(_filePath, line + Environment.NewLine);
+    }
+
+    public void LogDifficultyChange(
+        DifficultyLevel previousDifficulty,
+        DifficultyLevel newDifficulty,
+        string reason
+    ){
+        if (!_isLogging)
+        {
+            return;
+        }
+        
+        string line =
+            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | " +
+            $"DifficultyChanged: {previousDifficulty} -> {newDifficulty} | " +
+            $"Reason: {reason}";
+
+        File.AppendAllText(_filePath, line + Environment.NewLine);
+    }
+
+    private void CreateLogFile()
+    {
+        if (!_isLogging)
+        {
+            return;
+        }
+        
+        string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        string participantId = ParticipantSession.ParticipantId;
+
+        string fileName =
+            $"{_filePrefix}_" +
+            $"{participantId}_" +
+            $"{timestamp}.txt";
+
+        _filePath = Path.Combine(Application.persistentDataPath, fileName);
+
+        string header =
+            "VR Metrics Log" + Environment.NewLine +
+            $"Participant: {ParticipantSession.ParticipantId}" + Environment.NewLine +
+            $"Session Start: {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + Environment.NewLine +
+            $"File: {fileName}" + Environment.NewLine +
+            Environment.NewLine;
+
+        File.WriteAllText(_filePath, header);
+
+        Debug.Log($"Metrics log created at: {_filePath}", this);
+    }
+
+    public void FinalizeLog(MetricsSystem metrics)
+    {
+        if (!_isLogging)
+        {
+            return;
+        }
+        
+        if (_isFinalized)
+        {
+            return;
+        }
+
+        if (metrics == null)
+        {
+            Debug.LogError(
+                "[MetricsLogger] " +
+                "MetricsSystem es null.",
+                this
+            );
+
+            return;
+        }
+
+        string summary =
+            Environment.NewLine + Environment.NewLine +
+            "===== SESSION SUMMARY =====" + Environment.NewLine +
+            $"Participant: {ParticipantSession.ParticipantId}" + Environment.NewLine +
+            $"Total Interactions: {metrics.TotalInteractions}" + Environment.NewLine +
+            $"Successful: {metrics.SuccessfulInteractions}" + Environment.NewLine +
+            $"Failed: {metrics.FailedInteractions}" + Environment.NewLine +
+            $"Missed: {metrics.MissedInteractions}" + Environment.NewLine +
+            $"Success Rate: {metrics.SuccessRate:F4}" + Environment.NewLine +
+            $"Average Timing Error: {metrics.AverageTimingError:F4}" + Environment.NewLine +
+            $"Average Reaction Time: {metrics.AverageReactionTime:F4}" + Environment.NewLine +
+            $"Average Spatial Accuracy: {metrics.AverageSpatialAccuracy:F4}" + Environment.NewLine +
+            $"Average Direction Accuracy: {metrics.AverageDirectionAccuracy:F4}" + Environment.NewLine +
+            "===========================" + Environment.NewLine +
+            "===== END OF SESSION =====" + Environment.NewLine;
+
+        File.AppendAllText(
+            _filePath,
+            summary
+        );
+
+        _isFinalized = true;
+
+        Debug.Log(
+            $"[MetricsLogger] Log finalizado: " +
+            $"{_filePath}",
+            this
+        );
+    }
+}

@@ -1,0 +1,550 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[DisallowMultipleComponent]
+[RequireComponent(typeof(ExperienceBeatPlayer))]
+public sealed class BeatLightController : MonoBehaviour
+{
+    [Header("Beat Filter")]
+    [Tooltip("Solo cambia de color si la intensidad del beat alcanza este valor.")]
+    [Range(0f, 1f)]
+    [SerializeField] private float _minimumIntensity = 0.7f;
+
+
+    [Header("Base Colors")]
+
+    [Tooltip("Color base utilizado en todas las escenas excepto Danniel.")]
+    [SerializeField]
+    private Color _baseColor = new Color32(
+        0x7F,
+        0x7F,
+        0x7F,
+        0xFF
+    );
+
+    [Tooltip("Color base utilizado únicamente en la escena Danniel.")]
+    [SerializeField]
+    private Color _dannielBaseColor = new Color32(
+        0xBF,
+        0xBF,
+        0xBF,
+        0xFF
+    );
+
+
+    [Header("Beat Colors")]
+
+    [SerializeField]
+    private Color[] _palette =
+    {
+        Color.green,
+        Color.red,
+        Color.blue,
+        new Color(1f, 1f, 0f, 1f)
+    };
+
+    [Tooltip(
+        "Cuanto se mezcla el color con el blanco. " +
+        "Tambien se pondera por la intensidad del beat."
+    )]
+    [Range(0f, 1f)]
+    [SerializeField]
+    private float _colorStrength = 1f;
+
+
+    [Header("Pulse (Seconds)")]
+
+    [Min(0f)]
+    [SerializeField]
+    private float _holdDuration = 0.04f;
+
+    [Min(0.01f)]
+    [SerializeField]
+    private float _returnDuration = 0.16f;
+
+
+    // =========================
+    // DEBUG
+    // =========================
+
+    [Header("Debug")]
+
+    [SerializeField]
+    private bool _logPulses;
+
+
+    // =========================
+    // RUNTIME
+    // =========================
+
+    private readonly List<GameObject> _sceneRoots =
+        new List<GameObject>();
+
+    private readonly List<Light> _lights =
+        new List<Light>();
+
+    private ExperienceBeatPlayer _beatPlayer;
+    private Light _targetLight;
+
+    private Color _originalColor;
+    private bool _originalUseColorTemperature;
+
+    private Color _pulseColor;
+
+    private double _pulseStartTime;
+
+    private int _nextColorIndex;
+
+    private bool _pulseActive;
+    private bool _warnedMissingLight;
+
+
+    public Light CurrentLight => _targetLight;
+
+
+
+    /// Devuelve el color base correspondiente
+    /// a la escena activa.
+    private Color CurrentBaseColor
+    {
+        get
+        {
+            Scene scene = SceneManager.GetActiveScene();
+
+            if (scene.name == "Danniel")
+            {
+                return _dannielBaseColor;
+            }
+
+            return _baseColor;
+        }
+    }
+
+
+    private void OnEnable()
+    {
+        _beatPlayer = GetComponent<ExperienceBeatPlayer>();
+
+        _beatPlayer.BeatReached += HandleBeat;
+        ExperienceDiagnostics.LogSubscription("added", this, _beatPlayer);
+        _beatPlayer.PlaybackReset += HandlePlaybackReset;
+        ExperienceDiagnostics.LogSubscription("added", this, _beatPlayer);
+
+        SceneManager.activeSceneChanged +=
+            HandleActiveSceneChanged;
+
+        SceneManager.sceneLoaded +=
+            HandleSceneLoaded;
+
+        _nextColorIndex = 0;
+        _warnedMissingLight = false;
+    }
+
+
+    private void OnDisable()
+    {
+        if (_beatPlayer != null)
+        {
+            _beatPlayer.BeatReached -= HandleBeat;
+            ExperienceDiagnostics.LogSubscription("removed", this, _beatPlayer);
+            _beatPlayer.PlaybackReset -= HandlePlaybackReset;
+            ExperienceDiagnostics.LogSubscription("removed", this, _beatPlayer);
+        }
+
+        SceneManager.activeSceneChanged -=
+            HandleActiveSceneChanged;
+
+        SceneManager.sceneLoaded -=
+            HandleSceneLoaded;
+
+        ReleaseLight();
+    }
+
+
+    private void OnValidate()
+    {
+        _minimumIntensity =
+            Mathf.Clamp01(_minimumIntensity);
+
+        _colorStrength =
+            Mathf.Clamp01(_colorStrength);
+
+        _holdDuration =
+            Mathf.Max(0f, _holdDuration);
+
+        _returnDuration =
+            Mathf.Max(0.01f, _returnDuration);
+    }
+
+
+    private void Update()
+    {
+        if (_beatPlayer == null ||
+            !_beatPlayer.IsPlaying)
+        {
+            ResetPulse();
+            return;
+        }
+
+        if (_targetLight != null &&
+            !IsUsableLight(
+                _targetLight,
+                SceneManager.GetActiveScene()
+            ))
+        {
+            ReleaseLight();
+        }
+
+        if (_pulseActive &&
+            _targetLight != null)
+        {
+            ApplyPulse(
+                _beatPlayer.SongTime
+            );
+        }
+    }
+
+
+    private void HandleBeat(
+        BeatMapSO.Beat beat,
+        int beatIndex
+    )
+    {
+        if (beat.Intensity < _minimumIntensity ||
+            _palette == null ||
+            _palette.Length == 0)
+        {
+            ExperienceDiagnostics.RecordFrequentEvent("BeatLightController", "beat_discarded", this);
+            if (ExperienceDiagnostics.Level == ExperienceDiagnosticLevel.Detailed)
+                ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Detailed, "BEAT", "consumer_discarded_beat", this, null,
+                    "consumer=BeatLightController reason=below_intensity_or_empty_palette beat_index=" + beatIndex +
+                    " intensity=" + beat.Intensity.ToString("F4", System.Globalization.CultureInfo.InvariantCulture) +
+                    " minimum_intensity=" + _minimumIntensity.ToString("F4", System.Globalization.CultureInfo.InvariantCulture));
+            return;
+        }
+
+        if (!IsUsableLight(
+                _targetLight,
+                SceneManager.GetActiveScene()
+            ) &&
+            !BindActiveSceneLight())
+        {
+            if (!_warnedMissingLight)
+            {
+                Debug.LogWarning(
+                    "[BeatLightController] " +
+                    "La escena activa necesita una " +
+                    "Directional Light habilitada " +
+                    "en modo Realtime o Mixed.",
+                    this
+                );
+
+                _warnedMissingLight = true;
+            }
+
+            ExperienceDiagnostics.RecordFrequentEvent("BeatLightController", "beat_discarded_no_light", this);
+            if (ExperienceDiagnostics.Level == ExperienceDiagnosticLevel.Detailed)
+                ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Detailed, "BEAT", "consumer_discarded_beat", this, null,
+                    "consumer=BeatLightController reason=no_usable_active_scene_light beat_index=" + beatIndex);
+
+            return;
+        }
+
+        Color color =
+            _palette[
+                _nextColorIndex %
+                _palette.Length
+            ];
+
+        _nextColorIndex =
+            (_nextColorIndex + 1) %
+            _palette.Length;
+
+        Color baseColor =
+            CurrentBaseColor;
+
+        _pulseColor =
+            Color.Lerp(
+                baseColor,
+                color,
+                beat.Intensity *
+                _colorStrength
+            );
+
+        _pulseStartTime =
+            beat.Time;
+
+        _pulseActive = true;
+
+        ExperienceDiagnostics.RecordFrequentEvent("BeatLightController", "light_color_pulse", this);
+        if (ExperienceDiagnostics.Level == ExperienceDiagnosticLevel.Detailed)
+            ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Detailed, "BEAT", "consumer_action", this, null,
+                "consumer=BeatLightController action=light_color_pulse beat_index=" + beatIndex +
+                " intensity=" + beat.Intensity.ToString("F4", System.Globalization.CultureInfo.InvariantCulture) +
+                " target_scene=" + ExperienceDiagnostics.Field("name", _targetLight.gameObject.scene.name));
+
+        ApplyPulse(
+            _beatPlayer.SongTime
+        );
+
+        if (_logPulses)
+        {
+            Debug.Log(
+                $"[BeatLightController] " +
+                $"Beat {beatIndex + 1} | " +
+                $"Intensidad: {beat.Intensity:F2} | " +
+                $"Escena: {_targetLight.gameObject.scene.name}",
+                this
+            );
+        }
+    }
+
+
+    // =========================
+    // PULSE
+    // =========================
+
+    private void ApplyPulse(
+        double songTime
+    )
+    {
+        double elapsed =
+            songTime -
+            _pulseStartTime;
+
+        if (elapsed < 0.0 ||
+            elapsed >=
+            _holdDuration +
+            _returnDuration)
+        {
+            ResetPulse();
+            return;
+        }
+
+        float progress =
+            Mathf.Clamp01(
+                (float)(
+                    elapsed -
+                    _holdDuration
+                ) /
+                _returnDuration
+            );
+
+        Color baseColor =
+            CurrentBaseColor;
+
+        _targetLight.color =
+            Color.Lerp(
+                _pulseColor,
+                baseColor,
+                Mathf.SmoothStep(
+                    0f,
+                    1f,
+                    progress
+                )
+            );
+    }
+
+
+    private void HandlePlaybackReset()
+    {
+        if (ExperienceDiagnostics.Level == ExperienceDiagnosticLevel.Detailed)
+            ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Detailed, "BEAT", "consumer_action", this, null,
+                "consumer=BeatLightController action=reset_light_pulse");
+        ResetPulse();
+        _nextColorIndex = 0;
+    }
+
+
+    private void ResetPulse()
+    {
+        _pulseActive = false;
+
+        if (_targetLight != null)
+        {
+            _targetLight.color =
+                CurrentBaseColor;
+        }
+    }
+
+
+
+    private void HandleActiveSceneChanged(
+        Scene previous,
+        Scene current
+    )
+    {
+        ReleaseLight();
+
+        _nextColorIndex = 0;
+        _warnedMissingLight = false;
+
+        if (_beatPlayer != null &&
+            _beatPlayer.IsPlaying)
+        {
+            BindActiveSceneLight();
+        }
+    }
+
+
+    private void HandleSceneLoaded(
+        Scene scene,
+        LoadSceneMode mode
+    )
+    {
+        if (scene ==
+            SceneManager.GetActiveScene())
+        {
+            HandleActiveSceneChanged(
+                scene,
+                scene
+            );
+        }
+    }
+
+
+
+    private bool BindActiveSceneLight()
+    {
+        ReleaseLight();
+
+        Scene scene =
+            SceneManager.GetActiveScene();
+
+        if (!scene.IsValid() ||
+            !scene.isLoaded)
+        {
+            return false;
+        }
+
+        Light candidate =
+            FindDirectionalLight(scene);
+
+        if (candidate == null)
+        {
+            return false;
+        }
+
+        _targetLight =
+            candidate;
+
+        _originalColor =
+            candidate.color;
+
+        _originalUseColorTemperature =
+            candidate.useColorTemperature;
+
+        candidate.useColorTemperature =
+            false;
+
+        // Color dependiendo de la escena
+        candidate.color =
+            CurrentBaseColor;
+
+        _warnedMissingLight =
+            false;
+
+        return true;
+    }
+
+
+    private Light FindDirectionalLight(
+        Scene scene
+    )
+    {
+        if (IsUsableLight(
+            RenderSettings.sun,
+            scene
+        ))
+        {
+            return RenderSettings.sun;
+        }
+
+        Light candidate = null;
+
+        _sceneRoots.Clear();
+
+        scene.GetRootGameObjects(
+            _sceneRoots
+        );
+
+        foreach (GameObject root in _sceneRoots)
+        {
+            _lights.Clear();
+
+            root.GetComponentsInChildren(
+                false,
+                _lights
+            );
+
+            foreach (Light light in _lights)
+            {
+                if (!IsUsableLight(
+                    light,
+                    scene
+                ))
+                {
+                    continue;
+                }
+
+                if (light.gameObject.name ==
+                    "Directional Light")
+                {
+                    return light;
+                }
+
+                if (candidate == null ||
+                    light.intensity >
+                    candidate.intensity)
+                {
+                    candidate =
+                        light;
+                }
+            }
+        }
+
+        return candidate;
+    }
+
+
+    private static bool IsUsableLight(
+        Light light,
+        Scene scene
+    )
+    {
+        if (light == null ||
+            !light.isActiveAndEnabled ||
+            light.gameObject.scene != scene ||
+            light.type != LightType.Directional)
+        {
+            return false;
+        }
+
+#if UNITY_EDITOR
+        return light.lightmapBakeType !=
+               LightmapBakeType.Baked;
+#else
+        return light.bakingOutput.lightmapBakeType !=
+               LightmapBakeType.Baked;
+#endif
+    }
+
+
+
+    private void ReleaseLight()
+    {
+        _pulseActive = false;
+
+        if (_targetLight != null)
+        {
+            _targetLight.color =
+                _originalColor;
+
+            _targetLight.useColorTemperature =
+                _originalUseColorTemperature;
+        }
+
+        _targetLight = null;
+    }
+}

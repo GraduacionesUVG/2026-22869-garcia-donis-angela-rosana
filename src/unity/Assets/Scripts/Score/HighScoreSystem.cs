@@ -1,0 +1,176 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public sealed class HighScoreSystem : MonoBehaviour
+{
+    [Header("Events")]
+    [SerializeField] private ScoreRunEventChannelSO _scoreRunStarted;
+    [SerializeField] private FinalScoreEventChannelSO _finalScoreSubmitted;
+    [SerializeField] private RunResultEventChannelSO _runResultReady;
+
+    
+    [Header("Storage")]
+    [SerializeField] private HighScoreStorage _storage;
+
+
+    private readonly Dictionary<string, int> _highScores =
+        new Dictionary<string, int>();
+
+    private ScoreRunContext? _currentRun;
+
+
+    public ScoreRunContext? CurrentRun => _currentRun;
+
+
+    private void Awake()
+    {
+        if (_storage == null)
+        {
+            Debug.LogWarning(
+                "[HighScoreSystem] HighScoreStorage no está asignado. " +
+                "Los récords solo existirán durante esta sesión.",
+                this
+            );
+        }
+    }
+    
+
+    private void OnEnable()
+    {
+        if (_scoreRunStarted != null)
+        {
+            _scoreRunStarted.Raised += HandleScoreRunStarted;
+            ExperienceDiagnostics.LogSubscription("added", this, _scoreRunStarted);
+        }
+
+        if (_finalScoreSubmitted != null)
+        {
+            _finalScoreSubmitted.Raised += HandleFinalScoreSubmitted;
+            ExperienceDiagnostics.LogSubscription("added", this, _finalScoreSubmitted);
+        }
+    }
+
+
+    private void OnDisable()
+    {
+        if (_scoreRunStarted != null)
+        {
+            _scoreRunStarted.Raised -= HandleScoreRunStarted;
+            ExperienceDiagnostics.LogSubscription("removed", this, _scoreRunStarted);
+        }
+
+        if (_finalScoreSubmitted != null)
+        {
+            _finalScoreSubmitted.Raised -= HandleFinalScoreSubmitted;
+            ExperienceDiagnostics.LogSubscription("removed", this, _finalScoreSubmitted);
+        }
+    }
+
+
+    public int GetHighScore(string scoreId)
+    {
+        if (string.IsNullOrEmpty(scoreId))
+        {
+            return 0;
+        }
+
+        if (_highScores.TryGetValue(
+            scoreId,
+            out int cachedHighScore
+        ))
+        {
+            return cachedHighScore;
+        }
+
+        int storedHighScore = _storage != null
+            ? _storage.LoadHighScore(scoreId)
+            : 0;
+
+        _highScores[scoreId] = storedHighScore;
+
+        return storedHighScore;
+    }
+
+
+    public int GetHighScore(ScoreRunContext context)
+    {
+        return GetHighScore(context.ScoreId);
+    }
+
+
+    private void HandleScoreRunStarted(ScoreRunContext context)
+    {
+        _currentRun = context;
+        ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Flow, "SCORE", "score_context_received", this, null,
+            "score_id=" + ExperienceDiagnostics.Field("id", context.ScoreId) + " full=" + context.IsFullExperience);
+
+        // Debug.Log(
+        //     $"[HighScoreSystem] Run started | " +
+        //     $"Id: {context.ScoreId} | " +
+        //     $"Name: {context.DisplayName} | " +
+        //     $"HighScore: {GetHighScore(context)}",
+        //     this
+        // );
+    }
+
+
+    private void HandleFinalScoreSubmitted(int finalScore)
+    {
+        if (!_currentRun.HasValue)
+        {
+            Debug.LogWarning(
+                "[HighScoreSystem] Final score received without active run.",
+                this
+            );
+            ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Flow, "SCORE", "final_score_ignored", this, null,
+                "reason=no_score_run_context score=" + finalScore);
+
+            return;
+        }
+
+        ScoreRunContext context = _currentRun.Value;
+        int previousHighScore = GetHighScore(context.ScoreId);
+        bool isNewHighScore = finalScore > previousHighScore;
+
+        if (isNewHighScore)
+        {
+            _highScores[context.ScoreId] = finalScore;
+
+            if (_storage != null)
+            {
+                _storage.SaveHighScore(
+                    context.ScoreId,
+                    finalScore
+                );
+            }
+        }
+
+        int highScore = GetHighScore(context.ScoreId);
+
+        RunResult result = new RunResult(
+            context,
+            finalScore,
+            previousHighScore,
+            highScore,
+            isNewHighScore
+        );
+
+        Debug.Log(
+            $"[HighScoreSystem] Run result | " +
+            $"Id: {context.ScoreId} | " +
+            $"Score: {finalScore} | " +
+            $"Previous High Score: {previousHighScore} | " +
+            $"High Score: {highScore} | " +
+            $"New High Score: {isNewHighScore}",
+            this
+        );
+
+        if (_runResultReady != null)
+        {
+            ExperienceDiagnostics.Log(ExperienceDiagnosticLevel.Flow, "SCORE", "run_result_published", this, null,
+                "final_score=" + finalScore + " high_score=" + highScore + " is_new_high_score=" + isNewHighScore);
+            _runResultReady.RaiseEvent(result, this);
+        }
+    }
+}

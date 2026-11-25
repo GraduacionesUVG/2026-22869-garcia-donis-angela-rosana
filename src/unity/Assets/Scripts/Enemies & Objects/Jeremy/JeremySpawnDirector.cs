@@ -1,0 +1,360 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public sealed class JeremySpawnDirector :
+    MonoBehaviour,
+    IExperienceRuntime
+{
+    private sealed class ScheduledSpawn
+    {
+        public int BeatIndex;
+        public Transform SpawnPoint;
+        public double ExpectedHitTime;
+        public double SpawnTime;
+        public DifficultyLevel Difficulty;
+        public float MovementSpeed;
+        public float SpecificHandProbability;
+    }
+
+
+    [Header("Spawning")]
+    [SerializeField] private JeremyEnemySpawner _enemySpawner;
+    [SerializeField] private Transform[] _spawnPoints;
+
+
+    [Header("Beat Map")]
+    [SerializeField] private BeatMapSO _beatMap;
+
+
+    [Header("Scheduling")]
+    [SerializeField] private int _lookAheadBeats = 8;
+
+
+    [Header("Difficulty")]
+    [SerializeField] private JeremyDifficultyConfigSO _difficultyConfig;
+    [SerializeField] private DifficultyLevelEventChannelSO _difficultyChanged;
+
+
+    private readonly List<ScheduledSpawn> _scheduledSpawns = new List<ScheduledSpawn>();
+    private ExperienceMusicClock _musicClock;
+    private bool _isRunning;
+    private int _nextBeatIndex;
+    private DifficultyLevel _currentDifficulty;
+    private JeremyDifficultyProfile _currentProfile;
+
+
+    public void BeginExperience()
+    {
+        if (_isRunning)
+        {
+            return;
+        }
+
+        if (!ValidateReferences())
+        {
+            return;
+        }
+
+        _musicClock = FindFirstObjectByType<ExperienceMusicClock>();
+
+        if (_musicClock == null)
+        {
+            Debug.LogError(
+                "[JeremySpawnDirector] No se encontró ExperienceMusicClock.",
+                this
+            );
+
+            return;
+        }
+
+        if (_difficultyChanged != null)
+        {
+            _difficultyChanged.Raised += SetDifficulty;
+            _currentDifficulty = _difficultyChanged.CurrentDifficulty;
+        }
+        else
+        {
+            _currentDifficulty = DifficultyLevel.Normal;
+        }
+        
+        _currentProfile = _difficultyConfig.GetProfile(_currentDifficulty);
+
+        _isRunning = true;
+        _nextBeatIndex = 0;
+        while (_nextBeatIndex < _beatMap.Beats.Count &&
+               _beatMap.Beats[_nextBeatIndex].Time < _musicClock.SongTime)
+            _nextBeatIndex++;
+
+        _scheduledSpawns.Clear();
+
+        FillSchedule();
+    }
+
+
+    public void EndExperience()
+    {
+        if (_difficultyChanged != null)
+        {
+            _difficultyChanged.Raised -= SetDifficulty;
+        }
+
+        _isRunning = false;
+        _scheduledSpawns.Clear();
+    }
+
+
+    private void Update()
+    {
+        if (!_isRunning || !_musicClock.IsPlaying || Time.timeScale <= 0 || AudioListener.pause)
+        {
+            return;
+        }
+
+        ProcessScheduledSpawns();
+        FillSchedule();
+    }
+
+
+    private void FillSchedule()
+    {
+        while (
+            _scheduledSpawns.Count < _lookAheadBeats &&
+            _nextBeatIndex < _beatMap.Beats.Count)
+        {
+            int beatCount = _currentProfile.SpawnEveryNBeats;
+
+            int beatIndex = GetMostIntenseBeatIndex(
+                _nextBeatIndex,
+                beatCount
+            );
+
+            _nextBeatIndex += beatCount;
+
+            ScheduleBeat(beatIndex);
+        }
+    }
+
+
+    private void ScheduleBeat(int beatIndex)
+    {
+        double expectedHitTime = _beatMap.Beats[beatIndex].Time;
+
+        Transform spawnPoint = GetSpawnPointForSchedule();
+
+        if (spawnPoint == null)
+        {
+            return;
+        }
+        
+        float movementSpeed = _currentProfile.MovementSpeed;
+        float travelTime = CalculateTravelTime(spawnPoint, movementSpeed);
+        double spawnTime = expectedHitTime - travelTime;
+
+        if (spawnTime < _musicClock.SongTime)
+        {
+            return;
+        }
+
+        ScheduledSpawn scheduledSpawn = new ScheduledSpawn
+        {
+            BeatIndex = beatIndex,
+            SpawnPoint = spawnPoint,
+            ExpectedHitTime = expectedHitTime,
+            SpawnTime = spawnTime,
+            Difficulty = _currentDifficulty,
+            MovementSpeed = movementSpeed,
+            SpecificHandProbability = _currentProfile.SpecificHandProbability
+        };
+
+        InsertSorted(scheduledSpawn);
+    }
+
+
+    private void ProcessScheduledSpawns()
+    {
+        double songTime = _musicClock.SongTime;
+
+        while (
+            _scheduledSpawns.Count > 0 &&
+            songTime >= _scheduledSpawns[0].SpawnTime)
+        {
+            ScheduledSpawn scheduledSpawn = _scheduledSpawns[0];
+            _scheduledSpawns.RemoveAt(0);
+            // A late activation/seek must not replay the preceding song's spawn queue.
+            if (songTime - scheduledSpawn.SpawnTime > 0.1) continue;
+
+            // Debug.Log(
+            //     $"[JeremySpawnDirector] Spawn | SongTime: {songTime:F3} | " +
+            //     $"SpawnTime: {scheduledSpawn.SpawnTime:F3} | " +
+            //     $"ExpectedHitTime: {scheduledSpawn.ExpectedHitTime:F3}",
+            //     this
+            // );
+
+            _enemySpawner.SpawnAt(
+                scheduledSpawn.SpawnPoint,
+                scheduledSpawn.ExpectedHitTime,
+                scheduledSpawn.Difficulty,
+                scheduledSpawn.MovementSpeed,
+                scheduledSpawn.SpecificHandProbability
+            );
+        }
+    }
+
+
+    private void InsertSorted(ScheduledSpawn scheduledSpawn)
+    {
+        int insertIndex = 0;
+
+        while (
+            insertIndex < _scheduledSpawns.Count &&
+            _scheduledSpawns[insertIndex].SpawnTime <= scheduledSpawn.SpawnTime)
+        {
+            insertIndex++;
+        }
+
+        _scheduledSpawns.Insert(insertIndex, scheduledSpawn);
+    }
+
+
+    private Transform GetSpawnPointForSchedule()
+    {
+        if (_spawnPoints.Length == 1)
+        {
+            return _spawnPoints[0];
+        }
+
+        const int maxAttempts = 20;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            int randomIndex = Random.Range(0, _spawnPoints.Length);
+            Transform candidate = _spawnPoints[randomIndex];
+
+            if (!WouldCreateTooManyConsecutive(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return _spawnPoints[Random.Range(0, _spawnPoints.Length)];
+    }
+
+
+    private bool WouldCreateTooManyConsecutive(Transform candidate)
+    {
+        if (_scheduledSpawns.Count < 3)
+        {
+            return false;
+        }
+
+        int sameCount = 0;
+
+        for (int i = _scheduledSpawns.Count - 1; i >= 0; i--)
+        {
+            if (_scheduledSpawns[i].SpawnPoint != candidate)
+            {
+                break;
+            }
+
+            sameCount++;
+
+            if (sameCount >= 3)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    private float CalculateTravelTime(Transform spawnPoint, float movementSpeed)
+    {
+        float distanceToTarget = Vector3.Distance(spawnPoint.position, _enemySpawner.TargetPosition);
+
+        float travelDistance = distanceToTarget - _enemySpawner.IdealCutDistance;
+
+        travelDistance = Mathf.Max(0f, travelDistance);
+
+        return travelDistance / movementSpeed;
+    }
+
+    private int GetMostIntenseBeatIndex(int startIndex, int beatCount)
+    {
+        int endIndex = Mathf.Min(
+            startIndex + beatCount,
+            _beatMap.Beats.Count
+        );
+
+        int selectedIndex = startIndex;
+        float highestIntensity = _beatMap.Beats[startIndex].Intensity;
+
+        for (int i = startIndex + 1; i < endIndex; i++)
+        {
+            float intensity = _beatMap.Beats[i].Intensity;
+
+            if (intensity > highestIntensity)
+            {
+                highestIntensity = intensity;
+                selectedIndex = i;
+            }
+        }
+
+        return selectedIndex;
+    }
+
+    private bool ValidateReferences()
+    {
+        if (_enemySpawner == null)
+        {
+            Debug.LogError("[JeremySpawnDirector] No se asignó JeremyEnemySpawner.", this);
+            return false;
+        }
+
+        if (_spawnPoints == null || _spawnPoints.Length == 0)
+        {
+            Debug.LogError("[JeremySpawnDirector] No hay SpawnPoints asignados.", this);
+            return false;
+        }
+
+        for (int i = 0; i < _spawnPoints.Length; i++)
+        {
+            if (_spawnPoints[i] == null)
+            {
+                Debug.LogError($"[JeremySpawnDirector] SpawnPoint {i} es null.", this);
+                return false;
+            }
+        }
+
+        if (_beatMap == null || _beatMap.Beats.Count == 0)
+        {
+            Debug.LogError("[JeremySpawnDirector] No se asignó un BeatMap válido.", this);
+            return false;
+        }
+
+        if (_lookAheadBeats <= 0)
+        {
+            Debug.LogError("[JeremySpawnDirector] Look Ahead Beats debe ser mayor que 0.", this);
+            return false;
+        }
+
+        return true;
+    }
+
+    public void SetDifficulty(DifficultyLevel difficulty)
+    {
+        if (_currentDifficulty == difficulty)
+        {
+            return;
+        }
+
+        _currentDifficulty = difficulty;
+        _currentProfile = _difficultyConfig.GetProfile(_currentDifficulty);
+
+        Debug.Log(
+            $"[JeremySpawnDirector] Difficulty changed to {_currentDifficulty}.",
+            this
+        );
+    }
+}
